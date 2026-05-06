@@ -1,0 +1,12 @@
+profile_id,category,target_duration_min,linux_command,expected_primary_effect,notes
+baseline,reference,180,"sudo ./network-testing/scripts/apply_tc_profile.sh <iface> baseline","Reference behavior under normal network","Run before any shaping profile."
+latency_150,latency,90,"sudo ./network-testing/scripts/apply_tc_profile.sh <iface> latency_150","Moderate delay increase in decision timing","Fixed delay profile."
+latency_300_jitter_50,latency,90,"sudo ./network-testing/scripts/apply_tc_profile.sh <iface> latency_300_jitter_50","Delay + jitter causing timing spread","Use for variance sensitivity checks."
+latency_500_jitter_100,latency,90,"sudo ./network-testing/scripts/apply_tc_profile.sh <iface> latency_500_jitter_100","High delay and unstable timing tail","Expect higher p95/p99 delay."
+loss_1,packet_loss,90,"sudo ./network-testing/scripts/apply_tc_profile.sh <iface> loss_1","Minor drop-induced continuity impact","Low loss sanity profile."
+loss_3,packet_loss,90,"sudo ./network-testing/scripts/apply_tc_profile.sh <iface> loss_3","Moderate candle drop pressure","Recommended primary packet-loss profile."
+loss_5,packet_loss,90,"sudo ./network-testing/scripts/apply_tc_profile.sh <iface> loss_5","Strong continuity degradation risk","High-loss stress case."
+bandwidth_5mbit,bandwidth,90,"sudo ./network-testing/scripts/apply_tc_profile.sh <iface> bandwidth_5mbit","Mild buffering/queue pressure","Conservative throughput cap."
+bandwidth_2mbit,bandwidth,90,"sudo ./network-testing/scripts/apply_tc_profile.sh <iface> bandwidth_2mbit","Noticeable stale-data risk","Recommended primary throttling profile."
+bandwidth_1mbit,bandwidth,90,"sudo ./network-testing/scripts/apply_tc_profile.sh <iface> bandwidth_1mbit","Severe throughput bottleneck","High stress throttling profile."
+baseline_recovery,recovery,30,"sudo ./network-testing/scripts/apply_tc_profile.sh <iface> baseline","Recovery validation after shaping removal","Must be run after each shaped test block."
