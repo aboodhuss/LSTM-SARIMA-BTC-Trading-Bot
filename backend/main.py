@@ -35,6 +35,7 @@ import math
 import os
 import statistics
 from datetime import datetime, timezone
+from decimal import Decimal
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -98,6 +99,32 @@ network_sweep_state = {
     "latest_report": None,
     "original_simulation": None,
 }
+
+
+def json_safe(value):
+    """Convert live model state into values FastAPI can safely serialize."""
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Decimal):
+        as_float = float(value)
+        return as_float if math.isfinite(as_float) else None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if hasattr(value, "item"):
+        try:
+            return json_safe(value.item())
+        except Exception:
+            return str(value)
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    return value
 
 
 def _utc_now_iso():
@@ -447,7 +474,7 @@ async def websocket_endpoint(websocket: WebSocket):
             await asyncio.sleep(1)
             state = get_latest_state()
             if state["candle"]:
-                await websocket.send_json(state)
+                await websocket.send_json(json_safe(state))
     except WebSocketDisconnect:
         active_connections.remove(websocket)
         logger.info("Client disconnected.")
@@ -458,7 +485,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "latest_state": get_latest_state()}
+    return json_safe({"status": "ok", "latest_state": get_latest_state()})
 
 
 @app.get("/config")
@@ -468,18 +495,18 @@ async def get_config():
 
 @app.get("/model-history")
 async def model_history():
-    return {"status": "ok", "models": get_model_history(), "latest_state": get_latest_state()}
+    return json_safe({"status": "ok", "models": get_model_history(), "latest_state": get_latest_state()})
 
 
 @app.get("/network/profile")
 async def get_network_profile():
-    return {"status": "ok", "network": get_network_config(), "latest_state": get_latest_state()}
+    return json_safe({"status": "ok", "network": get_network_config(), "latest_state": get_latest_state()})
 
 
 @app.post("/config")
 async def update_config(payload: SimulationConfigUpdate):
     updated = set_simulation_config(payload.model_dump(exclude_none=True))
-    return {"status": "ok", "simulation": updated, "latest_state": get_latest_state()}
+    return json_safe({"status": "ok", "simulation": updated, "latest_state": get_latest_state()})
 
 
 @app.post("/simulation/start")
@@ -488,13 +515,13 @@ async def start_simulation(payload: SimulationStartRequest):
     if payload.ignoreFees is not None:
         updates["ignoreFees"] = payload.ignoreFees
     updated = start_live_simulation(updates)
-    return {"status": "ok", "simulation": updated, "latest_state": get_latest_state()}
+    return json_safe({"status": "ok", "simulation": updated, "latest_state": get_latest_state()})
 
 
 @app.post("/network/profile")
 async def update_network_profile(payload: NetworkConfigUpdate):
     updated = set_network_config(payload.model_dump(exclude_none=True))
-    return {"status": "ok", "network": updated, "latest_state": get_latest_state()}
+    return json_safe({"status": "ok", "network": updated, "latest_state": get_latest_state()})
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
