@@ -1,0 +1,35 @@
+{
+  "source": {
+    "provider": "Kaggle",
+    "minute_dataset": "swaptr/bitcoin-historical-data",
+    "minute_file": "data.csv",
+    "latest_daily_dataset": "hasanyiitakbulut/bitcoin-btc-historical-price-data-2020-2026",
+    "latest_daily_file": "BTC_prices.csv",
+    "symbol": "BTC/USD",
+    "minuteDatasetPath": "C:\\Users\\nickc\\.cache\\kagglehub\\datasets\\swaptr\\bitcoin-historical-data\\versions\\5\\data.csv",
+    "latestDailyEnd": "2026-03-10",
+    "latestDailyStart": "2020-12-08"
+  },
+  "model": {
+    "order": [
+      1,
+      1,
+      1
+    ],
+    "seasonal_order": [
+      1,
+      0,
+      1,
+      60
+    ],
+    "aic": 3291.7162988558457,
+    "bic": 3315.9148161866387,
+    "sample_size": 480,
+    "training_start": "2023-02-20 16:34:00+00:00",
+    "training_end": "2023-02-21 00:33:00+00:00",
+    "lookback_candles": 240,
+    "median_range_pct": 0.0004,
+    "median_volume_usd": 153.69559447145
+  },
+  "purpose": "Offline-trained BTC/USD SARIMA profile used as the missing-candle reconstruction pre-processor before feature engineering and LSTM inference."
+}
