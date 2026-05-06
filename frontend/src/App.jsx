@@ -316,8 +316,22 @@ function ModelPnLCard({ trace }) {
 }
 
 function getHttpBaseUrl() {
+  const configuredUrl = import.meta.env.VITE_API_BASE_URL;
+  if (configuredUrl) {
+    return configuredUrl.replace(/\/$/, '');
+  }
+
   const apiHost = window.location.hostname || 'localhost';
   return `${window.location.protocol}//${apiHost}:8000`;
+}
+
+function getWsUrl() {
+  const configuredUrl = import.meta.env.VITE_WS_URL;
+  if (configuredUrl) {
+    return configuredUrl.replace(/\/$/, '');
+  }
+
+  return `${getHttpBaseUrl().replace(/^https:/, 'wss:').replace(/^http:/, 'ws:')}/ws`;
 }
 
 function StatCard({ icon: Icon, label, value, hint, tone = 'neutral' }) {
@@ -660,9 +674,7 @@ function DashboardApp() {
   const [isStoppingAutomation, setIsStoppingAutomation] = useState(false);
   const [comparisonModelFilter, setComparisonModelFilter] = useState('all');
   const httpBaseUrl = getHttpBaseUrl();
-  const apiHost = window.location.hostname || 'localhost';
-  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${wsProtocol}//${apiHost}:8000/ws`;
+  const wsUrl = getWsUrl();
 
   const latestPrice = dashboardState.candle?.close ?? dashboardState.history.at(-1)?.close ?? null;
   const prediction = dashboardState.prediction;
