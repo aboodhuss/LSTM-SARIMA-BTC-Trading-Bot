@@ -48,7 +48,7 @@ import time
 from collections import deque
 from copy import deepcopy
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import pandas as pd
 import numpy as np
@@ -2443,30 +2443,72 @@ def replay_seeded_history(df_features, replay_window=180):
     latest_state["history"] = history_payload()
 
 
+def _request_json(url):
+    request = Request(url, headers={"User-Agent": "BTC-Trading-Bot/1.0"})
+    with urlopen(request, timeout=10) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _binance_history_rows(symbol, limit):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval=1m&limit={limit}"
+    raw = _request_json(url)
+    rows = []
+    for candle in raw:
+        rows.append(
+            {
+                "Timestamp": pd.to_datetime(candle[0], unit="ms"),
+                "Open": float(candle[1]),
+                "High": float(candle[2]),
+                "Low": float(candle[3]),
+                "Close": float(candle[4]),
+                "Volume": float(candle[5]),
+                "Is_Imputed": False,
+                "Gap_Minutes": 0.0,
+                "Receive_Lag_Ms": 0.0,
+            }
+        )
+    return rows
+
+
+def _coinbase_history_rows(limit):
+    url = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60"
+    raw = _request_json(url)
+    rows = []
+    for candle in raw[:limit]:
+        timestamp_s, low, high, open_price, close_price, volume = candle
+        rows.append(
+            {
+                "Timestamp": pd.to_datetime(int(timestamp_s), unit="s"),
+                "Open": float(open_price),
+                "High": float(high),
+                "Low": float(low),
+                "Close": float(close_price),
+                "Volume": float(volume),
+                "Is_Imputed": False,
+                "Gap_Minutes": 0.0,
+                "Receive_Lag_Ms": 0.0,
+            }
+        )
+    return rows
+
+
 def bootstrap_historical_data(symbol="BTCUSDT", limit=200):
     global df
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval=1m&limit={limit}"
+    rows = []
+    provider = "Binance REST"
+    try:
+        rows = _binance_history_rows(symbol, limit)
+    except Exception as exc:
+        logger.warning("Binance historical seed failed: %s", exc)
+        try:
+            provider = "Coinbase REST fallback"
+            rows = _coinbase_history_rows(limit)
+        except Exception as fallback_exc:
+            logger.warning("Coinbase historical seed failed: %s", fallback_exc)
+            append_log("Historical seed unavailable. Waiting for live stream.", "error")
+            return
 
     try:
-        with urlopen(url, timeout=10) as response:
-            raw = json.loads(response.read().decode("utf-8"))
-
-        rows = []
-        for candle in raw:
-            rows.append(
-                {
-                    "Timestamp": pd.to_datetime(candle[0], unit="ms"),
-                    "Open": float(candle[1]),
-                    "High": float(candle[2]),
-                    "Low": float(candle[3]),
-                    "Close": float(candle[4]),
-                    "Volume": float(candle[5]),
-                    "Is_Imputed": False,
-                    "Gap_Minutes": 0.0,
-                    "Receive_Lag_Ms": 0.0,
-                }
-            )
-
         df = pd.DataFrame(rows)
         df = df.drop_duplicates(subset=["Timestamp"], keep="last").sort_values("Timestamp").reset_index(drop=True)
         latest_state["history"] = history_payload()
@@ -2482,7 +2524,7 @@ def bootstrap_historical_data(symbol="BTCUSDT", limit=200):
             seeded_features = pattern_engine.extract_features(df)
             replay_seeded_history(seeded_features)
             refresh_portfolio_snapshot(float(last["Close"]))
-        append_log(f"Seeded {len(df)} historical candles from Binance REST.", "success")
+        append_log(f"Seeded {len(df)} historical candles from {provider}.", "success")
     except Exception as exc:
         logger.warning("Failed to seed historical candles: %s", exc)
         append_log("Historical seed unavailable. Waiting for live stream.", "error")

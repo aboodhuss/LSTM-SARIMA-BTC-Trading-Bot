@@ -44,6 +44,7 @@ from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
 from data_ingestion import (
+    bootstrap_historical_data,
     ingest_binance_data,
     get_latest_state,
     get_model_history,
@@ -54,7 +55,7 @@ from data_ingestion import (
     set_network_config,
     set_simulation_config,
 )
-from model_comparison import DEFAULT_FETCH_LOOPS, DEFAULT_LIVE_PHASE_CANDLES, generate_live_model_comparison_report
+from model_comparison import DEFAULT_FETCH_LOOPS, DEFAULT_LIVE_PHASE_CANDLES, generate_model_comparison_report
 
 logger = logging.getLogger("API_Server")
 logging.basicConfig(level=logging.INFO)
@@ -129,6 +130,15 @@ def json_safe(value):
 
 def _utc_now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+async def ensure_market_state():
+    latest = get_latest_state()
+    if latest.get("history") or latest.get("candle"):
+        return latest
+
+    await asyncio.to_thread(bootstrap_historical_data, "BTCUSDT", 200)
+    return get_latest_state()
 
 
 def _collect_network_sample(phase_name: str) -> Dict[str, object]:
@@ -293,9 +303,8 @@ async def _run_network_sweep(fetch_loops: int, poll_seconds: float):
                 network_sweep_state["latest_report"] = report_payload
 
         report = await asyncio.to_thread(
-            generate_live_model_comparison_report,
+            generate_model_comparison_report,
             fetch_loops=fetch_loops,
-            phase_candles=DEFAULT_LIVE_PHASE_CANDLES,
             progress_callback=update_progress,
             should_continue=should_continue,
         )
@@ -469,6 +478,7 @@ async def websocket_endpoint(websocket: WebSocket):
     active_connections.append(websocket)
     logger.info(f"Client connected. Total clients: {len(active_connections)}")
     try:
+        await ensure_market_state()
         while True:
             # We poll the latest state and broadcast it to the UI every second
             await asyncio.sleep(1)
@@ -485,7 +495,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/health")
 async def health_check():
-    return json_safe({"status": "ok", "latest_state": get_latest_state()})
+    latest = await ensure_market_state()
+    return json_safe({"status": "ok", "latest_state": latest})
 
 
 @app.get("/config")
@@ -495,33 +506,39 @@ async def get_config():
 
 @app.get("/model-history")
 async def model_history():
-    return json_safe({"status": "ok", "models": get_model_history(), "latest_state": get_latest_state()})
+    latest = await ensure_market_state()
+    return json_safe({"status": "ok", "models": get_model_history(), "latest_state": latest})
 
 
 @app.get("/network/profile")
 async def get_network_profile():
-    return json_safe({"status": "ok", "network": get_network_config(), "latest_state": get_latest_state()})
+    latest = await ensure_market_state()
+    return json_safe({"status": "ok", "network": get_network_config(), "latest_state": latest})
 
 
 @app.post("/config")
 async def update_config(payload: SimulationConfigUpdate):
     updated = set_simulation_config(payload.model_dump(exclude_none=True))
-    return json_safe({"status": "ok", "simulation": updated, "latest_state": get_latest_state()})
+    latest = await ensure_market_state()
+    return json_safe({"status": "ok", "simulation": updated, "latest_state": latest})
 
 
 @app.post("/simulation/start")
 async def start_simulation(payload: SimulationStartRequest):
+    await ensure_market_state()
     updates = {"initialEquity": payload.budget}
     if payload.ignoreFees is not None:
         updates["ignoreFees"] = payload.ignoreFees
     updated = start_live_simulation(updates)
-    return json_safe({"status": "ok", "simulation": updated, "latest_state": get_latest_state()})
+    latest = await ensure_market_state()
+    return json_safe({"status": "ok", "simulation": updated, "latest_state": latest})
 
 
 @app.post("/network/profile")
 async def update_network_profile(payload: NetworkConfigUpdate):
     updated = set_network_config(payload.model_dump(exclude_none=True))
-    return json_safe({"status": "ok", "network": updated, "latest_state": get_latest_state()})
+    latest = await ensure_market_state()
+    return json_safe({"status": "ok", "network": updated, "latest_state": latest})
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
