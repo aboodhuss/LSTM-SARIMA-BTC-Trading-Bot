@@ -2738,7 +2738,12 @@ async def ingest_kraken_data():
                 "params": {"channel": "ohlc", "symbol": ["BTC/USD"], "interval": 1},
             }))
 
-            last_closed_open_ms = None
+            # Track the previous candle so we can process it when interval_begin advances.
+            # Kraken's final update for a closing candle arrives ~1s BEFORE the minute
+            # boundary, so time.time() >= begin+60 is unreliable. Instead we detect the
+            # close by observing that interval_begin changed in the next message.
+            prev_kline = None
+            prev_open_ms = None
 
             async for raw_message in websocket:
                 receive_timestamp_ms = int(time.time() * 1000)
@@ -2756,9 +2761,10 @@ async def ingest_kraken_data():
                 if not items:
                     continue
 
-                # Always update the live display with the latest item in this batch.
+                # Update the live display immediately with the current open candle.
                 live_item = items[-1]
                 live_begin_s = pd.Timestamp(live_item["interval_begin"]).timestamp()
+                live_open_ms = int(live_begin_s * 1000)
                 live_close = float(live_item["close"])
                 latest_state["candle"] = {
                     "time": int(live_begin_s),
@@ -2769,97 +2775,95 @@ async def ingest_kraken_data():
                 }
                 refresh_portfolio_snapshot(live_close)
 
-                # Skip closed-candle processing for snapshots — bootstrap already seeded history.
-                # Processing hundreds of historical candles here would block the event loop and
-                # cause ping timeouts, dropping the WebSocket connection.
+                # On the first message (snapshot) just seed prev_kline and move on.
+                # We never process snapshot items as closed candles — that would block
+                # the event loop for several seconds and drop the WebSocket connection.
                 if message.get("type") == "snapshot":
+                    prev_kline = live_item
+                    prev_open_ms = live_open_ms
                     continue
 
-                # Process every closed candle in this batch (update messages only).
-                for kline in items:
-                    kline_begin_s = pd.Timestamp(kline["interval_begin"]).timestamp()
-                    kline_open_ms = int(kline_begin_s * 1000)
+                # When interval_begin advances, the previous candle has just closed.
+                if prev_kline is not None and live_open_ms != prev_open_ms:
+                    closed_kline = prev_kline
+                    closed_open_ms = prev_open_ms
+                    tick_timestamp_ms = closed_open_ms + CANDLE_INTERVAL_MS - 1
 
-                    if time.time() < kline_begin_s + 60:
-                        continue  # Candle still open
-                    if kline_open_ms == last_closed_open_ms:
-                        continue  # Already processed this close
-                    if _row_exists_for_open_ms(kline_open_ms):
-                        last_closed_open_ms = kline_open_ms
-                        continue  # Already in dataframe
+                    if not _row_exists_for_open_ms(closed_open_ms):
+                        publish_live_closed_candle(
+                            open_ms=closed_open_ms,
+                            open_price=float(closed_kline["open"]),
+                            high_price=float(closed_kline["high"]),
+                            low_price=float(closed_kline["low"]),
+                            close_price=float(closed_kline["close"]),
+                            volume=float(closed_kline.get("volume", 0.0)),
+                            receive_timestamp_ms=receive_timestamp_ms,
+                        )
+                        network_test_stats["receivedClosedCandles"] += 1
+                        applied_delay_ms = 0.0
 
-                    last_closed_open_ms = kline_open_ms
-                    tick_timestamp_ms = kline_open_ms + CANDLE_INTERVAL_MS - 1
+                        if network_test_config["enabled"]:
+                            base_latency = network_test_config["latencyMs"]
+                            jitter = network_test_config["jitterMs"]
+                            if jitter > 0:
+                                applied_delay_ms = max(0.0, base_latency + random.uniform(-jitter, jitter))
+                            else:
+                                applied_delay_ms = max(0.0, base_latency)
 
-                    publish_live_closed_candle(
-                        open_ms=kline_open_ms,
-                        open_price=float(kline["open"]),
-                        high_price=float(kline["high"]),
-                        low_price=float(kline["low"]),
-                        close_price=float(kline["close"]),
-                        volume=float(kline.get("volume", 0.0)),
-                        receive_timestamp_ms=receive_timestamp_ms,
-                    )
-                    network_test_stats["receivedClosedCandles"] += 1
-                    applied_delay_ms = 0.0
+                            packet_loss_chance = network_test_config["packetLossPct"] / 100.0
+                            if packet_loss_chance > 0 and random.random() < packet_loss_chance:
+                                network_test_stats["droppedClosedCandles"] += 1
+                                network_test_stats["lastAppliedDelayMs"] = applied_delay_ms
+                                latest_state["networkTest"] = network_test_config.copy()
+                                backfilled = fill_missing_candles_until(closed_open_ms, receive_timestamp_ms)
+                                dropped_entry = _insert_synthetic_candle(closed_open_ms, receive_timestamp_ms, gap_minutes=2.0)
+                                if dropped_entry:
+                                    backfilled.append(dropped_entry)
+                                for bfitem in backfilled:
+                                    process_latest_candle_state(bfitem["tick_timestamp_ms"], bfitem["receive_timestamp_ms"])
+                                append_log(
+                                    f"Simulated packet loss dropped candle "
+                                    f"({network_test_stats['droppedClosedCandles']}/{network_test_stats['receivedClosedCandles']}) "
+                                    "and inserted imputed candle.",
+                                    "error",
+                                )
+                                prev_kline = live_item
+                                prev_open_ms = live_open_ms
+                                continue
 
-                    if network_test_config["enabled"]:
-                        base_latency = network_test_config["latencyMs"]
-                        jitter = network_test_config["jitterMs"]
-                        if jitter > 0:
-                            applied_delay_ms = max(0.0, base_latency + random.uniform(-jitter, jitter))
-                        else:
-                            applied_delay_ms = max(0.0, base_latency)
+                            if applied_delay_ms > 0:
+                                await asyncio.sleep(applied_delay_ms / 1000.0)
 
-                        packet_loss_chance = network_test_config["packetLossPct"] / 100.0
-                        if packet_loss_chance > 0 and random.random() < packet_loss_chance:
-                            network_test_stats["droppedClosedCandles"] += 1
-                            network_test_stats["lastAppliedDelayMs"] = applied_delay_ms
-                            latest_state["networkTest"] = network_test_config.copy()
-                            backfilled = fill_missing_candles_until(kline_open_ms, receive_timestamp_ms)
-                            dropped_entry = _insert_synthetic_candle(kline_open_ms, receive_timestamp_ms, gap_minutes=2.0)
-                            if dropped_entry:
-                                backfilled.append(dropped_entry)
-                            for bfitem in backfilled:
-                                process_latest_candle_state(bfitem["tick_timestamp_ms"], bfitem["receive_timestamp_ms"])
-                            append_log(
-                                f"Simulated packet loss dropped candle "
-                                f"({network_test_stats['droppedClosedCandles']}/{network_test_stats['receivedClosedCandles']}) "
-                                "and inserted imputed candle.",
-                                "error",
-                            )
-                            continue
+                        network_test_stats["lastAppliedDelayMs"] = applied_delay_ms
+                        network_test_stats["processedClosedCandles"] += 1
+                        backfilled = fill_missing_candles_until(closed_open_ms, receive_timestamp_ms)
+                        for bfitem in backfilled:
+                            process_latest_candle_state(bfitem["tick_timestamp_ms"], bfitem["receive_timestamp_ms"])
 
-                        if applied_delay_ms > 0:
-                            await asyncio.sleep(applied_delay_ms / 1000.0)
+                        row = _build_candle_row(
+                            open_ms=closed_open_ms,
+                            open_price=float(closed_kline["open"]),
+                            high_price=float(closed_kline["high"]),
+                            low_price=float(closed_kline["low"]),
+                            close_price=float(closed_kline["close"]),
+                            volume=float(closed_kline.get("volume", 0.0)),
+                            receive_timestamp_ms=receive_timestamp_ms,
+                            is_imputed=False,
+                            gap_minutes=0.0,
+                        )
+                        _append_row_dict(row)
+                        network_test_stats["consecutiveSyntheticCandles"] = 0
+                        process_latest_candle_state(tick_timestamp_ms, receive_timestamp_ms)
 
-                    network_test_stats["lastAppliedDelayMs"] = applied_delay_ms
-                    network_test_stats["processedClosedCandles"] += 1
-                    backfilled = fill_missing_candles_until(kline_open_ms, receive_timestamp_ms)
-                    for bfitem in backfilled:
-                        process_latest_candle_state(bfitem["tick_timestamp_ms"], bfitem["receive_timestamp_ms"])
+                        log_market_table_row(
+                            pd.Timestamp(row["Timestamp"]).strftime("%Y-%m-%d %H:%M"),
+                            float(closed_kline["close"]),
+                            latest_state["prediction"]["action"],
+                            latest_state["prediction"]["confidence"],
+                        )
 
-                    row = _build_candle_row(
-                        open_ms=kline_open_ms,
-                        open_price=float(kline["open"]),
-                        high_price=float(kline["high"]),
-                        low_price=float(kline["low"]),
-                        close_price=float(kline["close"]),
-                        volume=float(kline.get("volume", 0.0)),
-                        receive_timestamp_ms=receive_timestamp_ms,
-                        is_imputed=False,
-                        gap_minutes=0.0,
-                    )
-                    _append_row_dict(row)
-                    network_test_stats["consecutiveSyntheticCandles"] = 0
-                    process_latest_candle_state(tick_timestamp_ms, receive_timestamp_ms)
-
-                    log_market_table_row(
-                        pd.Timestamp(row["Timestamp"]).strftime("%Y-%m-%d %H:%M"),
-                        float(kline["close"]),
-                        latest_state["prediction"]["action"],
-                        latest_state["prediction"]["confidence"],
-                    )
+                prev_kline = live_item
+                prev_open_ms = live_open_ms
 
         except websockets.ConnectionClosed:
             logger.warning("Kraken connection closed. Reconnecting...")
