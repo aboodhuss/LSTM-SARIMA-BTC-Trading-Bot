@@ -2492,6 +2492,67 @@ def _coinbase_history_rows(limit):
     return rows
 
 
+def _current_minute_open_ms():
+    return int(time.time() // 60 * CANDLE_INTERVAL_MS)
+
+
+def _publish_rest_market_rows(rows, provider):
+    global df
+    if not rows:
+        return
+
+    ordered_rows = sorted(rows, key=lambda row: row["Timestamp"])
+    latest_row = ordered_rows[-1]
+    receive_timestamp_ms = int(time.time() * 1000)
+
+    latest_state["candle"] = {
+        "time": int(pd.Timestamp(latest_row["Timestamp"]).timestamp()),
+        "open": float(latest_row["Open"]),
+        "high": float(latest_row["High"]),
+        "low": float(latest_row["Low"]),
+        "close": float(latest_row["Close"]),
+    }
+    refresh_portfolio_snapshot(float(latest_row["Close"]))
+
+    current_minute_open_ms = _current_minute_open_ms()
+    closed_rows = [
+        row for row in ordered_rows
+        if int(pd.Timestamp(row["Timestamp"]).timestamp() * 1000) < current_minute_open_ms
+    ]
+
+    for row in closed_rows:
+        open_ms = int(pd.Timestamp(row["Timestamp"]).timestamp() * 1000)
+        if _row_exists_for_open_ms(open_ms):
+            continue
+
+        backfilled = fill_missing_candles_until(open_ms, receive_timestamp_ms)
+        for item in backfilled:
+            process_latest_candle_state(item["tick_timestamp_ms"], item["receive_timestamp_ms"])
+
+        _append_row_dict(row)
+        network_test_stats["receivedClosedCandles"] += 1
+        network_test_stats["processedClosedCandles"] += 1
+        network_test_stats["lastAppliedDelayMs"] = 0.0
+        network_test_stats["consecutiveSyntheticCandles"] = 0
+        process_latest_candle_state(open_ms + CANDLE_INTERVAL_MS - 1, receive_timestamp_ms)
+        append_log(f"Processed fallback market candle from {provider}.", "info")
+
+
+async def poll_rest_market_data(symbol="BTCUSDT", interval_seconds=10):
+    provider = "Coinbase REST fallback"
+    while True:
+        try:
+            rows = await asyncio.to_thread(_coinbase_history_rows, 4)
+            _publish_rest_market_rows(rows, provider)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("REST market fallback failed: %s", exc)
+            append_log(f"REST market fallback failed: {exc}", "error")
+
+        await asyncio.sleep(interval_seconds)
+
+
 def bootstrap_historical_data(symbol="BTCUSDT", limit=200):
     global df
     rows = []

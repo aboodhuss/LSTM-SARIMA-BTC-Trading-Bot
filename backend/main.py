@@ -52,6 +52,7 @@ from data_ingestion import (
     get_network_config,
     get_simulation_config,
     live_training_loop,
+    poll_rest_market_data,
     start_live_simulation,
     set_network_config,
     set_simulation_config,
@@ -64,6 +65,7 @@ logging.basicConfig(level=logging.INFO)
 # --- State ---
 active_connections: list[WebSocket] = []
 ingestion_task = None
+rest_market_task = None
 live_training_task = None
 
 NETWORK_SWEEP_PHASES = [
@@ -329,14 +331,17 @@ async def _run_network_sweep(fetch_loops: int, poll_seconds: float):
 async def lifespan(app: FastAPI):
     # Startup: Start the background Binance ingestion loop
     logger.info("Starting Binance WebSocket Ingestion...")
-    global ingestion_task, live_training_task
+    global ingestion_task, rest_market_task, live_training_task
     ingestion_task = asyncio.create_task(ingest_binance_data())
+    rest_market_task = asyncio.create_task(poll_rest_market_data())
     live_training_task = asyncio.create_task(live_training_loop())
     yield
     # Shutdown
     logger.info("Shutting down Binance ingestion...")
     if ingestion_task:
         ingestion_task.cancel()
+    if rest_market_task:
+        rest_market_task.cancel()
     if live_training_task:
         live_training_task.cancel()
     if network_sweep_state.get("task"):
