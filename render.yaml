@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: btc-trading-bot-backend
+    name: lstm-sarima-btc-trading-bot
     env: python
     rootDir: backend
     buildCommand: pip install "torch>=2.0.0" --index-url https://download.pytorch.org/whl/cpu && pip install -r requirements.txt
@@ -9,6 +9,4 @@ services:
     autoDeploy: true
     envVars:
       - key: FRONTEND_ORIGINS
-        value: https://your-vercel-site.vercel.app,http://localhost:5173,http://127.0.0.1:5173
-      - key: FRONTEND_ORIGIN_REGEX
-        value: https://.*\.vercel\.app
+        value: "*"
