@@ -2355,7 +2355,7 @@ def advance_shadow_model_pool(df_features):
         shadow_model_pool.pop(label, None)
 
 
-def apply_closed_candle_logic(df_features, tick_timestamp_ms, receive_timestamp_ms):
+def apply_closed_candle_logic(df_features, tick_timestamp_ms, receive_timestamp_ms, signal_timestamp_ms=None):
     global pending_signal
 
     latest_features = df_features.iloc[-1]
@@ -2375,7 +2375,7 @@ def apply_closed_candle_logic(df_features, tick_timestamp_ms, receive_timestamp_
     maybe_close_on_risk_levels(latest_features, timestamp_label, candle_time)
     resolve_previous_signal(close_price)
 
-    signal_timestamp_ms = int(time.time() * 1000)
+    signal_timestamp_ms = int(signal_timestamp_ms if signal_timestamp_ms is not None else time.time() * 1000)
     action, raw_confidence = predict_with_active_model(df_features)
     data_quality = float(latest_features.get("Data_Quality", 1.0))
     confidence = float(
@@ -2438,7 +2438,7 @@ def replay_seeded_history(df_features, replay_window=180):
     for idx in range(start_index, len(df_features)):
         partial = df_features.iloc[: idx + 1]
         candle_timestamp_ms = int(pd.Timestamp(partial.iloc[-1]["Timestamp"]).timestamp() * 1000)
-        apply_closed_candle_logic(partial, candle_timestamp_ms, candle_timestamp_ms)
+        apply_closed_candle_logic(partial, candle_timestamp_ms, candle_timestamp_ms, signal_timestamp_ms=candle_timestamp_ms)
 
     latest_state["history"] = history_payload()
 
