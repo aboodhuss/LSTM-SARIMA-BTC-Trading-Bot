@@ -33,6 +33,7 @@ import asyncio
 import logging
 import math
 import os
+import re
 import statistics
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -344,19 +345,48 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-frontend_origins = [
-    origin.strip()
-    for origin in os.getenv("FRONTEND_ORIGINS", "*").split(",")
-    if origin.strip()
-]
+DEFAULT_FRONTEND_ORIGINS = (
+    "http://localhost:5173,"
+    "http://127.0.0.1:5173,"
+    "http://localhost:3000,"
+    "http://127.0.0.1:3000"
+)
+
+
+def _normalize_origin(origin: str) -> str:
+    return origin.strip().rstrip("/")
+
+
+def _configured_frontend_origins() -> List[str]:
+    raw_origins = os.getenv("FRONTEND_ORIGINS", DEFAULT_FRONTEND_ORIGINS)
+    origins = [_normalize_origin(origin) for origin in raw_origins.split(",") if origin.strip()]
+    vercel_frontend_url = os.getenv("VERCEL_FRONTEND_URL")
+    if vercel_frontend_url:
+        origins.append(_normalize_origin(vercel_frontend_url))
+    return list(dict.fromkeys(origins))
+
+
+frontend_origins = _configured_frontend_origins()
+allow_all_origins = "*" in frontend_origins
+frontend_origin_regex = os.getenv("FRONTEND_ORIGIN_REGEX", r"https://.*\.vercel\.app")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=frontend_origins,
-    allow_credentials=True,
+    allow_origins=["*"] if allow_all_origins else frontend_origins,
+    allow_origin_regex=None if allow_all_origins else frontend_origin_regex,
+    allow_credentials=not allow_all_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _origin_allowed(origin: Optional[str]) -> bool:
+    if not origin or allow_all_origins:
+        return True
+    normalized_origin = _normalize_origin(origin)
+    if normalized_origin in frontend_origins:
+        return True
+    return bool(frontend_origin_regex and re.fullmatch(frontend_origin_regex, normalized_origin))
 
 
 class SimulationConfigUpdate(BaseModel):
@@ -474,6 +504,12 @@ async def stop_network_test():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    origin = websocket.headers.get("origin")
+    if not _origin_allowed(origin):
+        logger.warning("Rejected WebSocket connection from unauthorized origin: %s", origin)
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
     active_connections.append(websocket)
     logger.info(f"Client connected. Total clients: {len(active_connections)}")
@@ -541,4 +577,4 @@ async def update_network_profile(payload: NetworkConfigUpdate):
     return json_safe({"status": "ok", "network": updated, "latest_state": latest})
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)

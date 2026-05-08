@@ -315,12 +315,26 @@ function ModelPnLCard({ trace }) {
   );
 }
 
+function normalizeBaseUrl(url) {
+  return String(url || '').trim().replace(/\/$/, '');
+}
+
 function getHttpBaseUrl() {
-  const configuredUrl = import.meta.env.VITE_API_BASE_URL;
+  const configuredUrl = import.meta.env.VITE_API_URL || import.meta.env.VITE_API_BASE_URL;
   if (configuredUrl) {
-    return configuredUrl.replace(/\/$/, '');
+    const normalizedUrl = normalizeBaseUrl(configuredUrl);
+    if (window.location.protocol === 'https:' && normalizedUrl.startsWith('http://')) {
+      console.error(
+        '[api] VITE_API_URL uses http on an https site. Use the Render https URL to avoid mixed-content blocking.',
+        normalizedUrl,
+      );
+    }
+    return normalizedUrl;
   }
 
+  if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+    console.warn('[api] VITE_API_URL is not set. Falling back to the current host on port 8000.');
+  }
   const apiHost = window.location.hostname || 'localhost';
   return `${window.location.protocol}//${apiHost}:8000`;
 }
@@ -328,10 +342,54 @@ function getHttpBaseUrl() {
 function getWsUrl() {
   const configuredUrl = import.meta.env.VITE_WS_URL;
   if (configuredUrl) {
-    return configuredUrl.replace(/\/$/, '');
+    return normalizeBaseUrl(configuredUrl);
   }
 
   return `${getHttpBaseUrl().replace(/^https:/, 'wss:').replace(/^http:/, 'ws:')}/ws`;
+}
+
+async function readApiError(response) {
+  try {
+    const payload = await response.json();
+    return JSON.stringify(payload);
+  } catch {
+    try {
+      return await response.text();
+    } catch {
+      return '';
+    }
+  }
+}
+
+async function apiJson(path, options = {}) {
+  const baseUrl = getHttpBaseUrl();
+  const url = `${baseUrl}${path}`;
+  try {
+    const response = await fetch(url, options);
+    if (!response.ok) {
+      const details = await readApiError(response);
+      console.error(`[api] ${options.method || 'GET'} ${url} failed: ${response.status} ${response.statusText}`, details);
+      throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+    }
+    return await response.json();
+  } catch (error) {
+    console.error(`[api] ${options.method || 'GET'} ${url} failed`, error);
+    throw error;
+  }
+}
+
+function applyLatestState(payload, setDashboardState) {
+  if (!payload?.latest_state) {
+    return;
+  }
+
+  setDashboardState((previous) => ({
+    ...previous,
+    ...payload.latest_state,
+    history: sanitizeHistory(payload.latest_state.history, previous.history),
+    candle: sanitizeCandle(payload.latest_state.candle, previous.candle),
+    logs: Array.isArray(payload.latest_state.logs) ? payload.latest_state.logs : previous.logs,
+  }));
 }
 
 function StatCard({ icon: Icon, label, value, hint, tone = 'neutral' }) {
@@ -429,12 +487,7 @@ function ModelLab() {
     let active = true;
 
     const fetchModelHistory = async () => {
-      const response = await fetch(`${httpBaseUrl}/model-history`);
-      if (!response.ok) {
-        return;
-      }
-
-      const payload = await response.json();
+      const payload = await apiJson('/model-history');
       if (!active) {
         return;
       }
@@ -447,9 +500,13 @@ function ModelLab() {
       setModelTraces(Array.isArray(payload.latest_state?.modelTraces) ? payload.latest_state.modelTraces : []);
     };
 
-    fetchModelHistory().catch(() => {});
+    fetchModelHistory().catch((error) => {
+      console.error('[model-history] Initial load failed', error);
+    });
     const interval = window.setInterval(() => {
-      fetchModelHistory().catch(() => {});
+      fetchModelHistory().catch((error) => {
+        console.error('[model-history] Refresh failed', error);
+      });
     }, 10000);
 
     return () => {
@@ -712,17 +769,11 @@ function DashboardApp() {
 
     const refreshAutomation = async () => {
       try {
-        const [statusResponse, reportResponse] = await Promise.all([
-          fetch(`${httpBaseUrl}/network-test/status`),
-          fetch(`${httpBaseUrl}/network-test/report`),
+        const [statusPayload, reportPayload] = await Promise.all([
+          apiJson('/network-test/status'),
+          apiJson('/network-test/report'),
         ]);
 
-        if (!statusResponse.ok || !reportResponse.ok || !active) {
-          return;
-        }
-
-        const statusPayload = await statusResponse.json();
-        const reportPayload = await reportResponse.json();
         if (!active) {
           return;
         }
@@ -743,14 +794,19 @@ function DashboardApp() {
           phases: Array.isArray(statusPayload.phases) ? statusPayload.phases : [],
         });
         setNetworkAutomationReport(reportPayload.report ?? null);
-      } catch (_) {
+      } catch (error) {
+        console.error('[network-test] Status refresh failed', error);
         // keep prior state on transient backend issues
       }
     };
 
-    refreshAutomation().catch(() => {});
+    refreshAutomation().catch((error) => {
+      console.error('[network-test] Initial status refresh failed', error);
+    });
     const interval = window.setInterval(() => {
-      refreshAutomation().catch(() => {});
+      refreshAutomation().catch((error) => {
+        console.error('[network-test] Poll failed', error);
+      });
     }, 5000);
 
     return () => {
@@ -863,24 +919,14 @@ function DashboardApp() {
 
     const bootstrap = async () => {
       try {
-        const response = await fetch(`${httpBaseUrl}/health`);
-        if (!response.ok) {
-          return;
-        }
-
-        const payload = await response.json();
+        const payload = await apiJson('/health');
         if (!mountedRef.current || !payload?.latest_state) {
           return;
         }
 
-        setDashboardState((previous) => ({
-          ...previous,
-          ...payload.latest_state,
-          history: sanitizeHistory(payload.latest_state.history, previous.history),
-          candle: sanitizeCandle(payload.latest_state.candle, previous.candle),
-          logs: Array.isArray(payload.latest_state.logs) ? payload.latest_state.logs : previous.logs,
-        }));
-      } catch {
+        applyLatestState(payload, setDashboardState);
+      } catch (error) {
+        console.error('[health] Backend bootstrap failed', error);
         // Websocket reconnect logic will handle unavailable backend cases.
       }
     };
@@ -891,6 +937,7 @@ function DashboardApp() {
       }
 
       setConnectionState('connecting');
+      console.info('[ws] Connecting to backend stream', wsUrl);
       const socket = new WebSocket(wsUrl);
       socketRef.current = socket;
 
@@ -900,6 +947,7 @@ function DashboardApp() {
         }
 
         setConnectionState('online');
+        console.info('[ws] Backend stream connected');
       };
 
       socket.onmessage = (event) => {
@@ -916,24 +964,31 @@ function DashboardApp() {
             candle: sanitizeCandle(payload.candle, previous.candle),
             logs: Array.isArray(payload.logs) ? payload.logs : previous.logs,
           }));
-        } catch {
+        } catch (error) {
+          console.error('[ws] Failed to parse backend message', error);
           setConnectionState('degraded');
         }
       };
 
-      socket.onerror = () => {
+      socket.onerror = (event) => {
         if (!mountedRef.current) {
           return;
         }
 
+        console.error('[ws] Backend stream error', event);
         setConnectionState('degraded');
       };
 
-      socket.onclose = () => {
+      socket.onclose = (event) => {
         if (!mountedRef.current || manuallyClosed) {
           return;
         }
 
+        console.warn('[ws] Backend stream closed; reconnecting', {
+          code: event.code,
+          reason: event.reason,
+          wasClean: event.wasClean,
+        });
         setConnectionState('offline');
         reconnectTimeoutRef.current = window.setTimeout(connect, 2500);
       };
@@ -1020,7 +1075,7 @@ function DashboardApp() {
     }
     setIsStartingSimulation(true);
     try {
-      const response = await fetch(`${httpBaseUrl}/simulation/start`, {
+      const payload = await apiJson('/simulation/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1029,20 +1084,9 @@ function DashboardApp() {
         }),
       });
 
-      if (!response.ok) {
-        return;
-      }
-
-      const payload = await response.json();
-      if (payload?.latest_state) {
-        setDashboardState((previous) => ({
-          ...previous,
-          ...payload.latest_state,
-          history: sanitizeHistory(payload.latest_state.history, previous.history),
-          candle: sanitizeCandle(payload.latest_state.candle, previous.candle),
-          logs: Array.isArray(payload.latest_state.logs) ? payload.latest_state.logs : previous.logs,
-        }));
-      }
+      applyLatestState(payload, setDashboardState);
+    } catch (error) {
+      console.error('[simulation] Start failed', error);
     } finally {
       setIsStartingSimulation(false);
     }
@@ -1051,7 +1095,7 @@ function DashboardApp() {
   const saveNetworkProfile = async () => {
     setIsSavingNetworkProfile(true);
     try {
-      const response = await fetch(`${httpBaseUrl}/network/profile`, {
+      const payload = await apiJson('/network/profile', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1062,20 +1106,9 @@ function DashboardApp() {
         }),
       });
 
-      if (!response.ok) {
-        return;
-      }
-
-      const payload = await response.json();
-      if (payload?.latest_state) {
-        setDashboardState((previous) => ({
-          ...previous,
-          ...payload.latest_state,
-          history: sanitizeHistory(payload.latest_state.history, previous.history),
-          candle: sanitizeCandle(payload.latest_state.candle, previous.candle),
-          logs: Array.isArray(payload.latest_state.logs) ? payload.latest_state.logs : previous.logs,
-        }));
-      }
+      applyLatestState(payload, setDashboardState);
+    } catch (error) {
+      console.error('[network-profile] Save failed', error);
     } finally {
       setIsSavingNetworkProfile(false);
     }
@@ -1084,15 +1117,11 @@ function DashboardApp() {
   const startAutomatedNetworkTest = async () => {
     setIsStartingAutomation(true);
     try {
-      const response = await fetch(`${httpBaseUrl}/network-test/start`, {
+      const payload = await apiJson('/network-test/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ fetchLoops: 1, pollSeconds: 2 }),
       });
-      if (!response.ok) {
-        return;
-      }
-      const payload = await response.json();
       setNetworkAutomation((prev) => ({
         ...prev,
         running: Boolean(payload.running),
@@ -1105,6 +1134,8 @@ function DashboardApp() {
         phases: Array.isArray(payload.phases) ? payload.phases : prev.phases,
       }));
       setNetworkAutomationReport(null);
+    } catch (error) {
+      console.error('[network-test] Start failed', error);
     } finally {
       setIsStartingAutomation(false);
     }
@@ -1113,15 +1144,13 @@ function DashboardApp() {
   const stopAutomatedNetworkTest = async () => {
     setIsStoppingAutomation(true);
     try {
-      const response = await fetch(`${httpBaseUrl}/network-test/stop`, {
+      const payload = await apiJson('/network-test/stop', {
         method: 'POST',
       });
-      if (!response.ok) {
-        return;
-      }
-      const payload = await response.json();
       setNetworkAutomation((prev) => ({ ...prev, running: false, currentPhase: null }));
       setNetworkAutomationReport(payload.report ?? null);
+    } catch (error) {
+      console.error('[network-test] Stop failed', error);
     } finally {
       setIsStoppingAutomation(false);
     }

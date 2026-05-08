@@ -3,7 +3,12 @@ services:
     name: btc-trading-bot-backend
     env: python
     rootDir: backend
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install "torch>=2.0.0" --index-url https://download.pytorch.org/whl/cpu && pip install -r requirements.txt
     startCommand: python -m uvicorn main:app --host 0.0.0.0 --port $PORT
     plan: starter
     autoDeploy: true
+    envVars:
+      - key: FRONTEND_ORIGINS
+        value: https://your-vercel-site.vercel.app,http://localhost:5173,http://127.0.0.1:5173
+      - key: FRONTEND_ORIGIN_REGEX
+        value: https://.*\.vercel\.app
