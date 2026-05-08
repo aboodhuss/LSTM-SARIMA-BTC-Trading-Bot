@@ -2718,6 +2718,153 @@ else:
 sync_live_training_state()
 
 
+async def ingest_kraken_data():
+    """Connect to Kraken v2 WebSocket for real-time 1-minute BTC/USD OHLC data.
+
+    Kraken is used instead of Binance because Binance blocks cloud-server IPs.
+    The message format differs but the downstream candle processing is identical.
+    """
+    global df
+    if df.empty:
+        await asyncio.to_thread(bootstrap_historical_data)
+
+    ws_url = "wss://ws.kraken.com/v2"
+    logger.info("Connecting to Kraken 1m OHLC stream for BTC/USD...")
+
+    async for websocket in websockets.connect(ws_url, ping_interval=20, ping_timeout=20):
+        try:
+            await websocket.send(json.dumps({
+                "method": "subscribe",
+                "params": {"channel": "ohlc", "symbol": ["BTC/USD"], "interval": 1},
+            }))
+
+            last_closed_open_ms = None
+
+            async for raw_message in websocket:
+                receive_timestamp_ms = int(time.time() * 1000)
+                try:
+                    message = json.loads(raw_message)
+                except Exception:
+                    continue
+
+                if message.get("channel") != "ohlc":
+                    continue
+                if message.get("type") not in ("snapshot", "update"):
+                    continue
+
+                items = message.get("data", [])
+                if not items:
+                    continue
+
+                # Always update the live display with the latest item in this batch.
+                live_item = items[-1]
+                live_begin_s = pd.Timestamp(live_item["interval_begin"]).timestamp()
+                live_close = float(live_item["close"])
+                latest_state["candle"] = {
+                    "time": int(live_begin_s),
+                    "open": float(live_item["open"]),
+                    "high": float(live_item["high"]),
+                    "low": float(live_item["low"]),
+                    "close": live_close,
+                }
+                refresh_portfolio_snapshot(live_close)
+
+                # Process every closed candle in this batch (snapshot has many; update has one).
+                for kline in items:
+                    kline_begin_s = pd.Timestamp(kline["interval_begin"]).timestamp()
+                    kline_open_ms = int(kline_begin_s * 1000)
+
+                    if time.time() < kline_begin_s + 60:
+                        continue  # Candle still open
+                    if kline_open_ms == last_closed_open_ms:
+                        continue  # Already processed this close
+                    if _row_exists_for_open_ms(kline_open_ms):
+                        last_closed_open_ms = kline_open_ms
+                        continue  # Already in dataframe
+
+                    last_closed_open_ms = kline_open_ms
+                    tick_timestamp_ms = kline_open_ms + CANDLE_INTERVAL_MS - 1
+
+                    publish_live_closed_candle(
+                        open_ms=kline_open_ms,
+                        open_price=float(kline["open"]),
+                        high_price=float(kline["high"]),
+                        low_price=float(kline["low"]),
+                        close_price=float(kline["close"]),
+                        volume=float(kline.get("volume", 0.0)),
+                        receive_timestamp_ms=receive_timestamp_ms,
+                    )
+                    network_test_stats["receivedClosedCandles"] += 1
+                    applied_delay_ms = 0.0
+
+                    if network_test_config["enabled"]:
+                        base_latency = network_test_config["latencyMs"]
+                        jitter = network_test_config["jitterMs"]
+                        if jitter > 0:
+                            applied_delay_ms = max(0.0, base_latency + random.uniform(-jitter, jitter))
+                        else:
+                            applied_delay_ms = max(0.0, base_latency)
+
+                        packet_loss_chance = network_test_config["packetLossPct"] / 100.0
+                        if packet_loss_chance > 0 and random.random() < packet_loss_chance:
+                            network_test_stats["droppedClosedCandles"] += 1
+                            network_test_stats["lastAppliedDelayMs"] = applied_delay_ms
+                            latest_state["networkTest"] = network_test_config.copy()
+                            backfilled = fill_missing_candles_until(kline_open_ms, receive_timestamp_ms)
+                            dropped_entry = _insert_synthetic_candle(kline_open_ms, receive_timestamp_ms, gap_minutes=2.0)
+                            if dropped_entry:
+                                backfilled.append(dropped_entry)
+                            for bfitem in backfilled:
+                                process_latest_candle_state(bfitem["tick_timestamp_ms"], bfitem["receive_timestamp_ms"])
+                            append_log(
+                                f"Simulated packet loss dropped candle "
+                                f"({network_test_stats['droppedClosedCandles']}/{network_test_stats['receivedClosedCandles']}) "
+                                "and inserted imputed candle.",
+                                "error",
+                            )
+                            continue
+
+                        if applied_delay_ms > 0:
+                            await asyncio.sleep(applied_delay_ms / 1000.0)
+
+                    network_test_stats["lastAppliedDelayMs"] = applied_delay_ms
+                    network_test_stats["processedClosedCandles"] += 1
+                    backfilled = fill_missing_candles_until(kline_open_ms, receive_timestamp_ms)
+                    for bfitem in backfilled:
+                        process_latest_candle_state(bfitem["tick_timestamp_ms"], bfitem["receive_timestamp_ms"])
+
+                    row = _build_candle_row(
+                        open_ms=kline_open_ms,
+                        open_price=float(kline["open"]),
+                        high_price=float(kline["high"]),
+                        low_price=float(kline["low"]),
+                        close_price=float(kline["close"]),
+                        volume=float(kline.get("volume", 0.0)),
+                        receive_timestamp_ms=receive_timestamp_ms,
+                        is_imputed=False,
+                        gap_minutes=0.0,
+                    )
+                    _append_row_dict(row)
+                    network_test_stats["consecutiveSyntheticCandles"] = 0
+                    process_latest_candle_state(tick_timestamp_ms, receive_timestamp_ms)
+
+                    log_market_table_row(
+                        pd.Timestamp(row["Timestamp"]).strftime("%Y-%m-%d %H:%M"),
+                        float(kline["close"]),
+                        latest_state["prediction"]["action"],
+                        latest_state["prediction"]["confidence"],
+                    )
+
+        except websockets.ConnectionClosed:
+            logger.warning("Kraken connection closed. Reconnecting...")
+            append_log("Kraken stream disconnected. Reconnecting...", "error")
+            continue
+        except Exception as exc:
+            logger.error("Kraken ingestion error: %s", exc)
+            append_log(f"Kraken backend error: {exc}", "error")
+            await asyncio.sleep(2)
+
+
 async def ingest_binance_data(symbol="btcusdt"):
     global df
     if df.empty:

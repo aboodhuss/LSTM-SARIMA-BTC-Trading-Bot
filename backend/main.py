@@ -46,7 +46,7 @@ from typing import Dict, List, Optional
 
 from data_ingestion import (
     bootstrap_historical_data,
-    ingest_binance_data,
+    ingest_kraken_data,
     get_latest_state,
     get_model_history,
     get_network_config,
@@ -329,10 +329,10 @@ async def _run_network_sweep(fetch_loops: int, poll_seconds: float):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Start the background Binance ingestion loop
-    logger.info("Starting Binance WebSocket Ingestion...")
+    # Startup: Start the Kraken WebSocket ingestion loop
+    logger.info("Starting Kraken WebSocket Ingestion...")
     global ingestion_task, rest_market_task, live_training_task
-    ingestion_task = asyncio.create_task(ingest_binance_data())
+    ingestion_task = asyncio.create_task(ingest_kraken_data())
     rest_market_task = asyncio.create_task(poll_rest_market_data())
     live_training_task = asyncio.create_task(live_training_loop())
     yield
