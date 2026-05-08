@@ -2769,7 +2769,13 @@ async def ingest_kraken_data():
                 }
                 refresh_portfolio_snapshot(live_close)
 
-                # Process every closed candle in this batch (snapshot has many; update has one).
+                # Skip closed-candle processing for snapshots — bootstrap already seeded history.
+                # Processing hundreds of historical candles here would block the event loop and
+                # cause ping timeouts, dropping the WebSocket connection.
+                if message.get("type") == "snapshot":
+                    continue
+
+                # Process every closed candle in this batch (update messages only).
                 for kline in items:
                     kline_begin_s = pd.Timestamp(kline["interval_begin"]).timestamp()
                     kline_open_ms = int(kline_begin_s * 1000)
